@@ -1,0 +1,6 @@
+# dsh-neuron-memory 插件挂载（id 必须等于命名空间名 = 包名 = index.js 的 export name）
+# 注意：这里不传 config —— 本插件没有导出 schemastery 的 Config，
+# 传了反而可能在校验阶段被拒（desktop profile 不装 optional peer）。
+- insert:
+    - id: dsh-neuron-memory
+      name: dsh-neuron-memory

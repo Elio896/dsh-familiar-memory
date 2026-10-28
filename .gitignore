@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+*.log
+boot.log
+config.json
+*.bak
+*.bak-*
+
+# 评测跑出来的明细（含真实记忆文本）
+eval/v0.json
+eval/fixtures.local.json
