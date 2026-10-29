@@ -30,8 +30,10 @@ await mod.apply(ctx, {})
 ok('注册了 7 个工具', registered.length === 7, String(registered.map((t) => t.name)))
 
 const byName = Object.fromEntries(registered.map((t) => [t.name, t]))
-const names = ['neuron_recall', 'neuron_learn', 'neuron_stats', 'neuron_story', 'neuron_replay', 'neuron_prune']
+// 默认只注册 7 个「跟她有关」的；维护类（sync/raw/consume/replay/prune）要 config.advanced=true 才放
+const names = ['neuron_recall', 'neuron_learn', 'neuron_stats', 'neuron_story', 'neuron_tidy', 'neuron_opening', 'neuron_handoff']
 ok('工具名齐全', names.every((n) => byName[n]), String(Object.keys(byName)))
+ok('维护类工具默认不注册', !byName.neuron_replay && !byName.neuron_prune && !byName.neuron_sync)
 
 // 每个工具都调一遍：execute 出错必须变成 {ok:false}，不能抛给宿主
 const calls = [
@@ -39,8 +41,8 @@ const calls = [
   ['neuron_recall', { query: '妈妈 神经元' }],
   ['neuron_stats', {}],
   ['neuron_story', {}],
-  ['neuron_replay', {}],
-  ['neuron_prune', {}],
+  ['neuron_opening', {}],
+  ['neuron_handoff', { topic: '测试话题', mood: 1, name: '妈妈' }],
 ]
 for (const [name, args] of calls) {
   try {

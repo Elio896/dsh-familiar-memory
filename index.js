@@ -26,13 +26,23 @@ try {
   if (typeof mod.defineTool === 'function') defineTool = mod.defineTool
 } catch { /* 用本地兜底 */ }
 
+const MAX_BODY = 64 * 1024
 const readBody = (req) => new Promise((resolve) => {
   let d = ''
-  req.on('data', (c) => { d += c })
+  let tooBig = false
+  req.on('data', (c) => {
+    if (tooBig) return
+    d += c
+    if (d.length > MAX_BODY) { tooBig = true; resolve({ __tooBig: true }) }
+  })
   req.on('end', () => {
+    if (tooBig) return
     try { resolve(JSON.parse(d || '{}')) } catch { resolve({}) }
   })
 })
+
+/** 只接受本机来源的写请求（防任意网页用 <img src> / fetch 触发） */
+const LOCAL_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/i
 
 export function apply(ctx, config) {
   const home = String(process.env.DSH_HOME || '').trim() || join(homedir(), '.dsh')
@@ -40,7 +50,7 @@ export function apply(ctx, config) {
   const bootLog = (m) => {
     try { appendFileSync(join(home, 'neuron-memory', 'boot.log'), `[${new Date().toISOString()}] ${m}\n`) } catch { }
   }
-  bootLog(`apply 开始 inject=${JSON.stringify(inject)} dshTools=${defineTool !== ((x) => x) ? '宿主' : '本地兜底'}`)
+  bootLog(`apply 开始 v0.2.0 inject=${JSON.stringify(inject)} dshTools=${defineTool !== ((x) => x) ? '宿主' : '本地兜底'}`)
   // 库位置优先级：环境变量 > 插件 config（cordis.patch.yml）> config.json > 默认空库
   const c = config || {}
   let cfg = {}
@@ -74,6 +84,7 @@ export function apply(ctx, config) {
     sinkBelow: optNum(c.sinkBelow),
     sinkLimit: optNum(c.sinkLimit),
     hops: optNum(c.hops),
+    warmBoost: optNum(c.warmBoost),
   }).filter(([, v]) => v !== undefined))
   const db = () => (store || (store = new NeuronStore(dbPath, sourcePath, storeOpts)))
   bootLog(`库: ${dbPath} 原文: ${sourcePath}`)
@@ -99,7 +110,11 @@ export function apply(ctx, config) {
     if (v === undefined || v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
     try { return JSON.parse(JSON.stringify(v)) } catch { return String(v) }
   }
+  // 维护/管道类工具默认不注册：对她说话时毫无用处，只会稀释选择。
+  // 需要时在 config 里写 advanced: true 全放出来。
+  const ADVANCED = new Set(['neuron_sync', 'neuron_raw', 'neuron_consume', 'neuron_replay', 'neuron_prune'])
   const tool = (spec) => {
+    if (ADVANCED.has(spec.name) && cfg.advanced !== true) return null
     try {
       return ctx.tools.register(defineTool({
         ...spec,
@@ -130,22 +145,37 @@ export function apply(ctx, config) {
         enum: ['lite', 'full'],
         description: 'lite = 省 token（只回节点文本，默认 3 条）；full = 带原文和同日上下文（默认 6 条）',
       },
+      scope: {
+        type: 'string',
+        description: '场景隔离，默认 private。群聊/工作等场景各自独立，跨场景不会互相召回',
+      },
+      tag: {
+        type: 'string',
+        description: '只查某类记忆：工作 / 闲聊（不传=不筛）',
+      },
     },
     async execute(args) {
       // 没显式指定就跟着模式走：聊天=full，工作=lite
       const mode = args.mode === 'lite' ? 'lite' : args.mode === 'full' ? 'full' : modeOf()
       const limit = Number(args.limit) || (mode === 'lite' ? 3 : 6)
-      const r = db().recall(String(args.query || ''), limit)
+      const r = db().recall(String(args.query || ''), limit, { scope: args.scope || 'private', tag: args.tag || '' })
       pushRecent(args.query, r, mode)
       return {
         ok: true,
         mode,
         count: r.count,
+        ...(mode === 'lite' ? { compact: true } : {}),
         ...(r.fallback
-          ? { fallback: true, hint: '没有相关记忆；下面是最近活跃的几条，不是相关结果' }
+          ? {
+            fallback: true,
+            hint: r.nodes.length
+              ? '没有相关记忆；下面是最近活跃的几条，不是相关结果'
+              : '没有相关记忆（这块是空的）',
+          }
           : {}),
         nodes: r.nodes.map((n) => (mode === 'lite'
-          ? { id: n.id, kind: n.kind, text: String(n.text || '').slice(0, 60) }
+          // 不截断文本：截断会把“下半句才是重点”的记忆切废。省 token 靠减条数（默认 3 条）。
+          ? { id: n.id, kind: n.kind, text: String(n.text || '') }
           : {
             id: n.id, kind: n.kind, score: n.score, text: n.text, ts: n.ts,
             source: n.source, context: n.context,
@@ -164,8 +194,32 @@ export function apply(ctx, config) {
         enum: ['fact', 'event', 'lesson', 'feeling', 'quote', 'preference', 'self'],
         description: '存档的桶，默认 fact',
       },
+      scope: {
+        type: 'string',
+        description: '场景隔离，默认 private。群聊/工作等场景各自独立',
+      },
+      tag: {
+        type: 'string',
+        description: '类别：工作 / 闲聊（用来分开查，不传=不分类）',
+      },
+      decidedAt: {
+        type: 'string',
+        description: '什么时候拍板的（work scope 默认=写入时间）。查状态时按它取最新，不按“最像”',
+      },
+      supersedes: {
+        type: 'number',
+        description: '覆盖了哪条旧决定的 id（旧的那条会自动沉底，不许再被当成“现在的”）',
+      },
     },
-    async execute(args) { return { ok: true, ...db().learn(String(args.text), args.kind || 'fact') } },
+    async execute(args) {
+      return {
+        ok: true,
+        ...db().learn(String(args.text), args.kind || 'fact', undefined, args.tag || '', args.scope || 'private', {
+          decidedAt: args.decidedAt,
+          supersedes: args.supersedes,
+        }),
+      }
+    },
   })
 
   tool({
@@ -207,6 +261,70 @@ export function apply(ctx, config) {
     async execute() { return { ok: true, ...db().prune() } },
   })
 
+  tool({
+    name: 'neuron_opening',
+    description: '会话开场：返回一段可直接放进 system prompt 的文字（称呼、上次心情、聊到哪、下次要问什么、记得什么），硬上限 250 字。换会话不是重新认识，是接着上次。',
+    parameters: {
+      scope: { type: 'string', description: '场景，默认 private' },
+      includeWork: { type: 'boolean', description: '工作会话传 true：追加「项目状态」（按拍板时间排序）。闲聊不要传，两个块互斥不叠加' },
+    },
+    async execute(args) {
+      return { ok: true, text: db().opening(args.scope || 'private', { includeWork: !!args.includeWork }) }
+    },
+  })
+
+  tool({
+    name: 'neuron_handoff',
+    description: '会话交接：只记三行——话题 / 卡在哪 / 下次我要问什么，加一个情绪数（-2 到 +2）。别写总结，三行就够。',
+    parameters: {
+      topic: { type: 'string', description: '这次聊的是什么' },
+      phase: { type: 'string', description: '卡在哪 / 到哪一步了' },
+      nextAsk: { type: 'string', description: '下次想问她什么' },
+      mood: { type: 'number', description: '她的情绪 -2（很难过）到 +2（挺开心）' },
+      name: { type: 'string', description: '称呼（写进关系表，下次开场第一句就是「你正在和 XX 说话」）' },
+      scope: { type: 'string', description: '场景，默认 private' },
+    },
+    async execute(args) {
+      return { ok: true, ...db().handoff({
+        topic: args.topic, phase: args.phase, nextAsk: args.nextAsk, mood: args.mood, name: args.name,
+      }, args.scope || 'private') }
+    },
+  })
+
+  tool({
+    name: 'neuron_sync',
+    description: '扫会话记录，把新的用户消息抓进 raw_log（自动录入的「抓」）。插件每 10 分钟自己也会跑一次，不用手动。',
+    parameters: {
+      days: { type: 'number', description: '扫最近几天，默认 3' },
+    },
+    async execute(args) {
+      return { ok: true, ...db().syncSessions({ days: Number(args.days) || 3 }) }
+    },
+  })
+
+  tool({
+    name: 'neuron_raw',
+    description: '读还没提炼的原始消息（提炼的原料）。提炼完用 neuron_consume 标记掉。',
+    parameters: {
+      limit: { type: 'number', description: '最多回几条，默认 30' },
+    },
+    async execute(args) {
+      return { ok: true, pending: db().pendingRaw(), items: db().rawPending(Number(args.limit) || 30) }
+    },
+  })
+
+  tool({
+    name: 'neuron_consume',
+    description: '把已提炼的原始消息标记掉。ids 不传=全部标记。',
+    parameters: {
+      ids: { type: 'string', description: '逗号分隔的 raw_log id；不传=全部标记' },
+    },
+    async execute(args) {
+      const ids = String(args.ids || '').split(',').map((x) => Number(x.trim())).filter((x) => Number.isInteger(x) && x > 0)
+      return { ok: true, ...db().markConsumed(ids) }
+    },
+  })
+
   // ---- 给前端面板的 HTTP API ----
   try {
     ctx.effect(() => ctx.webServer.register({
@@ -220,6 +338,13 @@ export function apply(ctx, config) {
         try {
           const url = new URL(req.url, 'http://127.0.0.1')
           const p = url.pathname
+          // 写请求只认本机来源：有 Origin/Referer 但不是 127.0.0.1/localhost 一律 403
+          if (req.method !== 'GET') {
+            const origin = String(req.headers?.origin || req.headers?.referer || '')
+            if (origin && !LOCAL_ORIGIN.test(origin)) {
+              return send(403, { ok: false, error: 'cross-origin write rejected' })
+            }
+          }
           if (p === '/api/neuron-memory/stats') return send(200, { ok: true, ...db().stats() })
           if (p === '/api/neuron-memory/top') {
             const n = Number(url.searchParams.get('n')) || 20
@@ -227,10 +352,18 @@ export function apply(ctx, config) {
           }
           if (p === '/api/neuron-memory/sunk') return send(200, { ok: true, nodes: db().sunk() })
           if (p === '/api/neuron-memory/recent') return send(200, { ok: true, items: recent })
+          if (p === '/api/neuron-memory/opening') {
+            return send(200, { ok: true, text: db().opening(url.searchParams.get('scope') || 'private') })
+          }
           if (p === '/api/neuron-memory/mode') {
             if (req.method === 'POST') {
               const body = await readBody(req)
-              setMode(body.mode)
+              if (body.__tooBig) return send(413, { ok: false, error: 'body too large' })
+              const m = String(body.mode || '')
+              if (!['chat', 'work', 'lite', 'full'].includes(m)) {
+                return send(400, { ok: false, error: 'mode must be chat|work|lite|full' })
+              }
+              setMode(m)
             }
             return send(200, { ok: true, mode: currentMode, recall: modeOf() })
           }
@@ -240,12 +373,28 @@ export function apply(ctx, config) {
             return send(200, { ok: true, ...r })
           }
           if (p === '/api/neuron-memory/story') return send(200, { ok: true, items: db().story(url.searchParams.get('day') || undefined) })
-          if (p === '/api/neuron-memory/replay') return send(200, { ok: true, ...db().replay(url.searchParams.get('day') || undefined) })
-          if (p === '/api/neuron-memory/prune') return send(200, { ok: true, ...db().prune() })
-          if (p === '/api/neuron-memory/tidy') return send(200, { ok: true, ...db().tidy() })
+          // 以下三个会写库：只认 POST
+          if (p === '/api/neuron-memory/replay') {
+            if (req.method !== 'POST') return send(405, { ok: false, error: 'use POST' })
+            return send(200, { ok: true, ...db().replay(url.searchParams.get('day') || undefined) })
+          }
+          if (p === '/api/neuron-memory/prune') {
+            if (req.method !== 'POST') return send(405, { ok: false, error: 'use POST' })
+            return send(200, { ok: true, ...db().prune() })
+          }
+          if (p === '/api/neuron-memory/tidy') {
+            if (req.method !== 'POST') return send(405, { ok: false, error: 'use POST' })
+            return send(200, { ok: true, ...db().tidy() })
+          }
           if (req.method === 'POST' && p === '/api/neuron-memory/learn') {
             const body = await readBody(req)
-            return send(200, { ok: true, ...db().learn(String(body.text || ''), body.kind || 'fact') })
+            if (body.__tooBig) return send(413, { ok: false, error: 'body too large' })
+            return send(200, { ok: true, ...db().learn(String(body.text || ''), body.kind || 'fact', undefined, '', body.scope || 'private') })
+          }
+          if (req.method === 'POST' && p === '/api/neuron-memory/handoff') {
+            const body = await readBody(req)
+            if (body.__tooBig) return send(413, { ok: false, error: 'body too large' })
+            return send(200, { ok: true, ...db().handoff(body, body.scope || 'private') })
           }
           return send(404, { ok: false, error: `unknown ${req.method} ${p}` })
         } catch (e) {
@@ -256,6 +405,29 @@ export function apply(ctx, config) {
     bootLog('HTTP 路由已挂 /api/neuron-memory')
   } catch (e) {
     bootLog(`HTTP 路由没挂上: ${e?.stack || e}`) /* 没有 webServer 也能用工具 */
+  }
+
+  // 自动录入：插件自己定时扫会话记录，把用户消息抓进 raw_log。
+  // 只「抓原文」，不判断、不写库——提炼仍由我按规矩做（插件不知道哪句值得记）。
+  // 想让它顺手提炼，显式调 neuron_sync 时传 autoExtract。
+  try {
+    const autoOn = cfg.autoSync !== false
+    if (autoOn) {
+      const mins = Math.max(1, Number(cfg.autoSyncMinutes) || 10)
+      const timer = setInterval(() => {
+        try {
+          const r = db().syncSessions({ days: 2, autoExtract: false })
+          if (r.added) bootLog(`自动录入 +${r.added} 条（待提炼 ${r.pending}）`)
+        } catch (e) { bootLog(`自动录入失败: ${e?.message || e}`) }
+      }, mins * 60 * 1000)
+      if (typeof timer.unref === 'function') timer.unref()
+      ctx.effect(() => () => clearInterval(timer))
+      bootLog(`自动录入定时器已挂（每 ${mins} 分钟扫一次）`)
+    } else {
+      bootLog('自动录入已关（config.autoSync=false）')
+    }
+  } catch (e) {
+    bootLog(`自动录入定时器没挂上: ${e?.message || e}`)
   }
   bootLog('apply 结束')
 }

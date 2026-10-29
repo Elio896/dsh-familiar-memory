@@ -1,6 +1,6 @@
 {
   "name": "dsh-neuron-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "本地记忆层：按预算注入、情绪优先、可审计、不联网。给 DeepSeek Harness 用。",
   "main": "index.js",
@@ -31,7 +31,8 @@
     "ARCHITECTURE.md",
     "FINDINGS.md",
     "LICENSE",
-    "FEATURES.md"
+    "FEATURES.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {
@@ -50,8 +51,8 @@
     }
   },
   "engines": {
-    "dsh": ">=0.1.7",
-    "node": ">=22.5"
+    "node": ">=22.15",
+    "dsh": ">=0.2.0"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*",

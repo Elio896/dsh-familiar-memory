@@ -30,7 +30,7 @@ install.mjs         一条命令安装（复制、登记、自检）
 ```sql
 nodes(
   id INTEGER PRIMARY KEY,
-  kind TEXT,            -- fact / event / lesson / feeling / quote / preference / self / digest
+  kind TEXT,            -- fact / event / lesson / feeling / quote / preference / self
   text TEXT,            -- 压缩过的一句话
   ts TEXT,              -- 创建时间 YYYY-MM-DDTHH:MM
   importance REAL,      -- 基础分（3.0 / 2.5 / 1.6 / 1.3）
@@ -67,18 +67,20 @@ edges(
 ```
 query
   → termsOf(): 整词 + 中文 2-gram + 英文整词
-  → 种子：text LIKE 任意词，按「命中词数 → importance」取前 5
-  → 扩散 hops 跳（默认 2）：
+  → 每个查询词算 IDF：df 从 nodes_vec 查，idf = ln(1 + N/df)
+  → 种子：FTS5 倒排（unicode61 + 预切 2-gram）用 bm25 捞候选 50 条；FTS 不可用退回 LIKE
+       rel = Σidf(命中的词) / Σidf(全部词)；整词命中直接 rel = 1
+       rel >= minRel(0.30) 才当种子；活跃记忆取前 5，沉底记忆要精确命中 ≥2 词才进
+  → 扩散 hops 跳（**默认 0，图未启用**；实验显示 1 跳只会把噪音从 33% 拉到 64%）：
        每条边 ew = weight × decay(last_active, halfLifeDays)
        ew < 0.05 不扩；rel 以「弱主题」开头不扩（防止泛词把整库拖出来）
-       强度 = 父强度 × ew
-       每步走完刷新边的 last_active（复习）
-  → 排序：score = 强度 × max(权重, 0) / 3
-       权重 = importance - weightDecayPerDay × 天数
-       沉底节点权重再 ×0.3（还查得到，只是排后面）
-       score < 0.15 丢弃
+       强度 = 父强度 × ew（max 传播，不累加）
+  → 排序：score = rel × 权重/3 × 温度系数 × 沉底折扣
+       权重 = importance × 0.5^(天数/半衰期)     ← 指数衰减，恒正
+       沉底节点：权重地板 1.5，分数 ×0.4
+  → 复习：只刷「真正返回」的节点 + 它回种子的路径；last_active 只回血一半（不是重置到 now）
   → 前 limit 条，附带：
-       source   —— 回查 source_db 的原文（与节点文本相同时不带）
+       source   —— 回查 source_db 的原文（与节点文本相同则不带；只对导入了原文库的老库有用）
        context  —— 同一天前后各一条（只给前 2 条）
 ```
 
@@ -126,11 +128,14 @@ POST /learn   {text, kind?}
 config:
   db: /path/to/neuron.db
   source_db: /path/to/memory.db
-  halfLifeDays: 10          # 边半衰期
-  weightDecayPerDay: 0.1    # 节点权重每天掉多少
-  sinkBelow: 1.0            # 低于它沉底
+  halfLifeDays: 10          # 半衰期（节点和边共用同一条指数曲线）
+  weightDecayPerDay: 0.1    # 保留字段（指数衰减后不再使用）
+  sinkBelow: 0.5            # 低于它沉底（指数衰减下从 1.0 调到 0.5）
   sinkLimit: 3              # 一次最多沉几条
-  hops: 2                   # 扩散跳数
+  hops: 0                   # 扩散跳数（默认 0 = 图未启用）
+  minRel: 0.30              # 相关性门限
+  noFallback: true          # 零命中返回空，不拿 top() 充数
+  warmBoost: 1.15           # 温度桶在排序里的加权
 ```
 
 ## 10. 设计权衡（为什么不做别的）

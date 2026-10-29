@@ -96,7 +96,7 @@ window.__ModuleLoader__.load({
 
       const doAction = async (path, label) => {
         try {
-          const r = await jget(path)
+          const r = await jpost(path, {})   // 写操作走 POST（服务端只认 POST）
           setMsg(label + '：' + JSON.stringify(r).slice(0, 120))
           refresh()
         } catch (e) { setMsg(label + '失败：' + e.message) }
