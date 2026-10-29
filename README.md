@@ -1,4 +1,4 @@
-# dsh-neuron-memory
+# dsh-familiar-memory
 
 给 ds 加一层可以按关键词点亮一小片的联想记忆，只把点亮的那一片送进上下文。
 
